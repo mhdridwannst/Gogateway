@@ -10,10 +10,28 @@ server:
 routes:
   - name: "users-service"
     path_prefix: "/api/v1/users"
-    target_url: "http://127.0.0.1:9001"
+    strategy: "round_robin"
     strip_prefix: true
+    backends:
+      - "http://127.0.0.1:9001"
+      - "http://127.0.0.1:9002"
+    health_check:
+      path: "/healthz"
+      interval: 5s
+      timeout: 2s
+      unhealthy_threshold: 3
+      healthy_threshold: 2
 
   - name: "orders-service"
     path_prefix: "/api/v1/orders"
-    target_url: "http://127.0.0.1:9002"
+    strategy: "least_conn"
     strip_prefix: false
+    backends:
+      - "http://127.0.0.1:9003"
+      - "http://127.0.0.1:9004"
+    health_check:
+      path: "/healthz"
+      interval: 5s
+      timeout: 2s
+      unhealthy_threshold: 3
+      healthy_threshold: 2

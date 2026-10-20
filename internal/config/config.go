@@ -11,6 +11,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	StrategyRoundRobin = "round_robin"
+	StrategyLeastConn  = "least_conn"
+)
+
 // Config represents the root configuration for the gateway.
 type Config struct {
 	Server ServerConfig  `yaml:"server"`
@@ -28,12 +33,24 @@ type ServerConfig struct {
 	MaxHeaderBytes    int           `yaml:"max_header_bytes"`
 }
 
-// RouteConfig defines how an incoming request path maps to an upstream backend.
+// HealthCheckConfig defines active and passive health check parameters for a route.
+type HealthCheckConfig struct {
+	Path               string        `yaml:"path"`
+	Interval           time.Duration `yaml:"interval"`
+	Timeout            time.Duration `yaml:"timeout"`
+	UnhealthyThreshold int           `yaml:"unhealthy_threshold"`
+	HealthyThreshold   int           `yaml:"healthy_threshold"`
+}
+
+// RouteConfig defines how an incoming request path maps to a pool of upstream backends.
 type RouteConfig struct {
-	Name        string `yaml:"name"`
-	PathPrefix  string `yaml:"path_prefix"`
-	TargetURL   string `yaml:"target_url"`
-	StripPrefix bool   `yaml:"strip_prefix"`
+	Name        string            `yaml:"name"`
+	PathPrefix  string            `yaml:"path_prefix"`
+	TargetURL   string            `yaml:"target_url"` // Legacy single-target shorthand
+	Backends    []string          `yaml:"backends"`   // Multi-backend pool URLs
+	Strategy    string            `yaml:"strategy"`   // "round_robin" (default) or "least_conn"
+	StripPrefix bool              `yaml:"strip_prefix"`
+	HealthCheck HealthCheckConfig `yaml:"health_check"`
 }
 
 // Load reads a YAML configuration file from the given path, applies defaults, and validates it.
@@ -81,6 +98,29 @@ func (c *Config) applyDefaults() {
 	if c.Server.MaxHeaderBytes == 0 {
 		c.Server.MaxHeaderBytes = 1 << 20 // 1 MB
 	}
+
+	for i := range c.Routes {
+		r := &c.Routes[i]
+		// Backward compatibility: promote single target_url into Backends slice.
+		if len(r.Backends) == 0 && r.TargetURL != "" {
+			r.Backends = []string{r.TargetURL}
+		}
+		if r.Strategy == "" {
+			r.Strategy = StrategyRoundRobin
+		}
+		if r.HealthCheck.Interval == 0 {
+			r.HealthCheck.Interval = 10 * time.Second
+		}
+		if r.HealthCheck.Timeout == 0 {
+			r.HealthCheck.Timeout = 2 * time.Second
+		}
+		if r.HealthCheck.UnhealthyThreshold == 0 {
+			r.HealthCheck.UnhealthyThreshold = 3
+		}
+		if r.HealthCheck.HealthyThreshold == 0 {
+			r.HealthCheck.HealthyThreshold = 2
+		}
+	}
 }
 
 // Validate checks that all required configuration fields are present and sane.
@@ -107,15 +147,33 @@ func (c *Config) Validate() error {
 		}
 		seenPrefixes[r.PathPrefix] = struct{}{}
 
-		parsedURL, err := url.Parse(r.TargetURL)
-		if err != nil {
-			return fmt.Errorf("route %q: invalid target_url: %w", r.Name, err)
+		if r.Strategy != StrategyRoundRobin && r.Strategy != StrategyLeastConn {
+			return fmt.Errorf("route %q: unsupported strategy %q (must be %q or %q)",
+				r.Name, r.Strategy, StrategyRoundRobin, StrategyLeastConn)
 		}
-		if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-			return fmt.Errorf("route %q: target_url scheme must be http or https", r.Name)
+
+		if len(r.Backends) == 0 {
+			return fmt.Errorf("route %q: at least one backend url is required", r.Name)
 		}
-		if parsedURL.Host == "" {
-			return fmt.Errorf("route %q: target_url host is required", r.Name)
+
+		for _, rawURL := range r.Backends {
+			parsedURL, err := url.Parse(rawURL)
+			if err != nil {
+				return fmt.Errorf("route %q: invalid backend url %q: %w", r.Name, rawURL, err)
+			}
+			if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+				return fmt.Errorf("route %q: backend url scheme must be http or https", r.Name)
+			}
+			if parsedURL.Host == "" {
+				return fmt.Errorf("route %q: backend url host is required", r.Name)
+			}
+		}
+
+		if r.HealthCheck.Path != "" && !strings.HasPrefix(r.HealthCheck.Path, "/") {
+			return fmt.Errorf("route %q: health_check.path must start with '/'", r.Name)
+		}
+		if r.HealthCheck.UnhealthyThreshold < 1 || r.HealthCheck.HealthyThreshold < 1 {
+			return fmt.Errorf("route %q: health_check thresholds must be >= 1", r.Name)
 		}
 	}
 

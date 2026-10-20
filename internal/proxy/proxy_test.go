@@ -132,3 +132,69 @@ func TestGatewayRoutingAndProxy(t *testing.T) {
 		})
 	}
 }
+func TestLoadBalancingAndPassiveFailover(t *testing.T) {
+	// Backend 1 always returns 500 Internal Server Error
+	b1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer b1.Close()
+
+	// Backend 2 always returns 200 OK
+	b2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-from-b2"))
+	}))
+	defer b2.Close()
+
+	cfg := &config.Config{
+		Routes: []config.RouteConfig{
+			{
+				Name:       "orders",
+				PathPrefix: "/orders",
+				Strategy:   config.StrategyRoundRobin,
+				Backends:   []string{b1.URL, b2.URL},
+				HealthCheck: config.HealthCheckConfig{
+					UnhealthyThreshold: 2,
+					HealthyThreshold:   2,
+				},
+			},
+		},
+	}
+
+	gw, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+
+	gatewayServer := httptest.NewServer(gw)
+	defer gatewayServer.Close()
+
+	// Send 4 requests:
+	// Req 1 -> b1 (500, failure #1)
+	// Req 2 -> b2 (200)
+	// Req 3 -> b1 (500, failure #2 -> b1 transitions to UNHEALTHY!)
+	// Req 4 -> b2 (200)
+	for i := 0; i < 4; i++ {
+		resp, err := http.Get(gatewayServer.URL + "/orders")
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	// Now b1 is marked unhealthy. The next 3 requests MUST all be routed only to b2 (200 OK).
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(gatewayServer.URL + "/orders")
+		if err != nil {
+			t.Fatalf("post-failover request %d failed: %v", i, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK from healthy backend b2, got %d", resp.StatusCode)
+		}
+		if gotBackend := resp.Header.Get("X-Gateway-Backend"); gotBackend != b2.URL {
+			t.Errorf("expected traffic routed to %q, got %q", b2.URL, gotBackend)
+		}
+	}
+}

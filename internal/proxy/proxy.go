@@ -9,17 +9,20 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mhdridwannst/Gogateway/internal/balancer"
 	"github.com/mhdridwannst/Gogateway/internal/config"
+	"github.com/mhdridwannst/Gogateway/internal/health"
 )
 
 type routeEntry struct {
 	name        string
 	pathPrefix  string
 	stripPrefix bool
-	proxy       *httputil.ReverseProxy
+	lb          balancer.Balancer
+	healthCfg   config.HealthCheckConfig
 }
 
-// Gateway is the core Layer-7 HTTP reverse proxy router.
+// Gateway is the core Layer-7 HTTP reverse proxy and load balancer router.
 type Gateway struct {
 	routes []routeEntry
 }
@@ -29,18 +32,46 @@ func New(cfg *config.Config) (*Gateway, error) {
 	entries := make([]routeEntry, 0, len(cfg.Routes))
 
 	for _, rc := range cfg.Routes {
-		targetURL, err := url.Parse(rc.TargetURL)
-		if err != nil {
-			return nil, fmt.Errorf("parsing target url for route %q: %w", rc.Name, err)
+		rawURLs := rc.Backends
+		if len(rawURLs) == 0 && rc.TargetURL != "" {
+			rawURLs = []string{rc.TargetURL}
 		}
 
-		rp := newReverseProxy(rc, targetURL)
+		backends := make([]*balancer.Backend, 0, len(rawURLs))
+
+		for _, rawURL := range rawURLs {
+			targetURL, err := url.Parse(rawURL)
+			if err != nil {
+				return nil, fmt.Errorf("parsing backend url %q for route %q: %w", rawURL, rc.Name, err)
+			}
+
+			var b *balancer.Backend
+			rp := newReverseProxy(rc, targetURL, func() *balancer.Backend {
+				return b
+			})
+			b = balancer.NewBackend(
+				targetURL,
+				rp,
+				rc.HealthCheck.UnhealthyThreshold,
+				rc.HealthCheck.HealthyThreshold,
+			)
+			backends = append(backends, b)
+		}
+
+		var lb balancer.Balancer
+		switch rc.Strategy {
+		case config.StrategyLeastConn:
+			lb = balancer.NewLeastConnections(backends)
+		default:
+			lb = balancer.NewRoundRobin(backends)
+		}
 
 		entries = append(entries, routeEntry{
 			name:        rc.Name,
 			pathPrefix:  rc.PathPrefix,
 			stripPrefix: rc.StripPrefix,
-			proxy:       rp,
+			lb:          lb,
+			healthCfg:   rc.HealthCheck,
 		})
 	}
 
@@ -51,7 +82,22 @@ func New(cfg *config.Config) (*Gateway, error) {
 	return &Gateway{routes: entries}, nil
 }
 
-func newReverseProxy(rc config.RouteConfig, target *url.URL) *httputil.ReverseProxy {
+// HealthTargetGroups exports all route backend pools for active health checking.
+func (g *Gateway) HealthTargetGroups() []health.TargetGroup {
+	groups := make([]health.TargetGroup, 0, len(g.routes))
+	for _, rt := range g.routes {
+		groups = append(groups, health.TargetGroup{
+			RouteName:  rt.name,
+			HealthPath: rt.healthCfg.Path,
+			Interval:   rt.healthCfg.Interval,
+			Timeout:    rt.healthCfg.Timeout,
+			Backends:   rt.lb.Backends(),
+		})
+	}
+	return groups
+}
+
+func newReverseProxy(rc config.RouteConfig, target *url.URL, getBackend func() *balancer.Backend) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
@@ -69,10 +115,31 @@ func newReverseProxy(rc config.RouteConfig, target *url.URL) *httputil.ReversePr
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Set("X-Gateway-Route", rc.Name)
+			resp.Header.Set("X-Gateway-Backend", target.String())
+
+			if b := getBackend(); b != nil {
+				if resp.StatusCode >= http.StatusInternalServerError {
+					if b.RecordFailure() {
+						log.Printf("[WARN] passive health check: backend %s on route %q marked UNHEALTHY (status %d)",
+							target.String(), rc.Name, resp.StatusCode)
+					}
+				} else {
+					b.RecordSuccess()
+				}
+			}
+
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[ERROR] proxy error on route %q (%s %s): %v", rc.Name, r.Method, r.URL.Path, err)
+			if b := getBackend(); b != nil {
+				if b.RecordFailure() {
+					log.Printf("[WARN] passive health check: backend %s on route %q marked UNHEALTHY (%v)",
+						target.String(), rc.Name, err)
+				}
+			}
+
+			log.Printf("[ERROR] proxy error on route %q -> %s (%s %s): %v",
+				rc.Name, target.String(), r.Method, r.URL.Path, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"bad gateway","message":"upstream server is unreachable"}` + "\n"))
@@ -84,7 +151,14 @@ func newReverseProxy(rc config.RouteConfig, target *url.URL) *httputil.ReversePr
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, rt := range g.routes {
 		if matchesPrefix(r.URL.Path, rt.pathPrefix) {
-			rt.proxy.ServeHTTP(w, r)
+			backend := rt.lb.Next()
+			if backend == nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":"service unavailable","message":"no healthy upstream backends available"}` + "\n"))
+				return
+			}
+			backend.ServeHTTP(w, r)
 			return
 		}
 	}

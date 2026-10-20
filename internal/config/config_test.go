@@ -27,6 +27,37 @@ routes:
 			wantErrMsg: "",
 		},
 		{
+			name: "valid multi-backend configuration with least_conn",
+			yamlContent: `
+routes:
+  - name: "orders"
+    path_prefix: "/orders"
+    strategy: "least_conn"
+    backends:
+      - "http://localhost:8001"
+      - "http://localhost:8002"
+    health_check:
+      path: "/healthz"
+      interval: 5s
+      timeout: 1s
+      unhealthy_threshold: 2
+      healthy_threshold: 2
+`,
+			wantErrMsg: "",
+		},
+		{
+			name: "reject unsupported load balancing strategy",
+			yamlContent: `
+routes:
+  - name: "orders"
+    path_prefix: "/orders"
+    strategy: "random_magic"
+    backends:
+      - "http://localhost:8001"
+`,
+			wantErrMsg: "unsupported strategy",
+		},
+		{
 			name: "reject empty routes",
 			yamlContent: `
 server:
@@ -66,7 +97,7 @@ routes:
     path_prefix: "/files"
     target_url: "ftp://localhost:21"
 `,
-			wantErrMsg: "target_url scheme must be http or https",
+			wantErrMsg: "backend url scheme must be http or https",
 		},
 		{
 			name: "reject unknown yaml field",
