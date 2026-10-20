@@ -1,0 +1,19 @@
+server:
+  listen_addr: ":8080"
+  read_timeout: 5s
+  read_header_timeout: 2s
+  write_timeout: 10s
+  idle_timeout: 60s
+  shutdown_timeout: 10s
+  max_header_bytes: 1048576 # 1 MB
+
+routes:
+  - name: "users-service"
+    path_prefix: "/api/v1/users"
+    target_url: "http://127.0.0.1:9001"
+    strip_prefix: true
+
+  - name: "orders-service"
+    path_prefix: "/api/v1/orders"
+    target_url: "http://127.0.0.1:9002"
+    strip_prefix: false
