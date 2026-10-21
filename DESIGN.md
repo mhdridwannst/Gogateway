@@ -29,3 +29,20 @@
 
 - **Decision**: Combine periodic background HTTP `GET` probes (`internal/health`) with real-time passive failure detection in `ReverseProxy.ModifyResponse` (HTTP `5xx`) and `ReverseProxy.ErrorHandler` (network/dial failures).
 - **Rationale**: Active checks alone have a detection blind spot between probe intervals (e.g., up to 5-10 seconds of dropped traffic if a backend crashes right after a probe). Passive checks trip the backend to unhealthy immediately after `unhealthy_threshold` consecutive live failures, while active probes allow the backend to automatically recover once it starts returning `2xx/3xx` responses again.
+
+## Phase 3: Resilience and Protection (Rate Limiting, Circuit Breaker, Retries, IP Filter)
+
+### 6. Lazy Token-Bucket Refill with Background TTL Eviction
+
+- **Decision**: Compute token refills lazily on each incoming request using elapsed time ($\Delta t \times \text{rate}$) protected by a `sync.Mutex`, paired with a single background janitor goroutine that evicts idle client IPs after `client_ttl`.
+- **Rationale**: Spawning a `time.Ticker` goroutine per client IP would allow an attacker to exhaust server memory and scheduler resources via IP spoofing. Lazy math calculation requires zero background timers per IP, while periodic TTL eviction prevents unbounded map growth.
+
+### 7. Idempotent-Only Transport Retries with Exponential Backoff
+
+- **Decision**: Implement retries inside a custom `http.RoundTripper` (`retryTransport`) that only retries requests when a network/transport error occurs AND the HTTP method is idempotent (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) with an empty body.
+- **Rationale**: Retrying non-idempotent requests like `POST` after a mid-flight network drop risks duplicate side effects (e.g., double-charging a payment). Exponential backoff ($50\text{ms} \times 2^{\text{attempt}-1}$) prevents retry storms against struggling backends.
+
+### 8. Per-Route Three-State Circuit Breaker
+
+- **Decision**: Wrap each route handler with a state machine (`Closed` $\rightarrow$ `Open` $\rightarrow$ `Half-Open` $\rightarrow$ `Closed`) that trips when consecutive `5xx` responses reach `failure_threshold`.
+- **Rationale**: While passive health checks isolate individual bad nodes in a pool, a route-level circuit breaker protects the entire upstream service (e.g., when a shared database goes down across all nodes) by failing fast with `503 Service Unavailable` and bounding concurrent probe traffic during recovery (`half_open_max_requests`).

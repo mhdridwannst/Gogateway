@@ -1,24 +1,30 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mhdridwannst/Gogateway/internal/balancer"
 	"github.com/mhdridwannst/Gogateway/internal/config"
 	"github.com/mhdridwannst/Gogateway/internal/health"
+	"github.com/mhdridwannst/Gogateway/internal/middleware"
 )
 
 type routeEntry struct {
 	name        string
 	pathPrefix  string
 	stripPrefix bool
+	timeout     time.Duration
 	lb          balancer.Balancer
+	handler     http.Handler
 	healthCfg   config.HealthCheckConfig
 }
 
@@ -31,12 +37,26 @@ type Gateway struct {
 func New(cfg *config.Config) (*Gateway, error) {
 	entries := make([]routeEntry, 0, len(cfg.Routes))
 
+	baseTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	for _, rc := range cfg.Routes {
 		rawURLs := rc.Backends
 		if len(rawURLs) == 0 && rc.TargetURL != "" {
 			rawURLs = []string{rc.TargetURL}
 		}
 
+		rtTransport := newRetryTransport(baseTransport, rc.Retries, rc.RetryBackoff)
 		backends := make([]*balancer.Backend, 0, len(rawURLs))
 
 		for _, rawURL := range rawURLs {
@@ -46,7 +66,7 @@ func New(cfg *config.Config) (*Gateway, error) {
 			}
 
 			var b *balancer.Backend
-			rp := newReverseProxy(rc, targetURL, func() *balancer.Backend {
+			rp := newReverseProxy(rc, targetURL, rtTransport, func() *balancer.Backend {
 				return b
 			})
 			b = balancer.NewBackend(
@@ -66,11 +86,33 @@ func New(cfg *config.Config) (*Gateway, error) {
 			lb = balancer.NewRoundRobin(backends)
 		}
 
+		var routeHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			backend := lb.Next()
+			if backend == nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":"service unavailable","message":"no healthy upstream backends available"}` + "\n"))
+				return
+			}
+			backend.ServeHTTP(w, r)
+		})
+
+		if rc.CircuitBreaker.Enabled {
+			cb := middleware.NewCircuitBreaker(
+				rc.CircuitBreaker.FailureThreshold,
+				rc.CircuitBreaker.ResetTimeout,
+				rc.CircuitBreaker.HalfOpenMaxReqs,
+			)
+			routeHandler = cb.Wrap(routeHandler)
+		}
+
 		entries = append(entries, routeEntry{
 			name:        rc.Name,
 			pathPrefix:  rc.PathPrefix,
 			stripPrefix: rc.StripPrefix,
+			timeout:     rc.Timeout,
 			lb:          lb,
+			handler:     routeHandler,
 			healthCfg:   rc.HealthCheck,
 		})
 	}
@@ -97,8 +139,9 @@ func (g *Gateway) HealthTargetGroups() []health.TargetGroup {
 	return groups
 }
 
-func newReverseProxy(rc config.RouteConfig, target *url.URL, getBackend func() *balancer.Backend) *httputil.ReverseProxy {
+func newReverseProxy(rc config.RouteConfig, target *url.URL, transport http.RoundTripper, getBackend func() *balancer.Backend) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.SetXForwarded()
@@ -151,14 +194,12 @@ func newReverseProxy(rc config.RouteConfig, target *url.URL, getBackend func() *
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, rt := range g.routes {
 		if matchesPrefix(r.URL.Path, rt.pathPrefix) {
-			backend := rt.lb.Next()
-			if backend == nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = w.Write([]byte(`{"error":"service unavailable","message":"no healthy upstream backends available"}` + "\n"))
-				return
+			if rt.timeout > 0 {
+				ctx, cancel := context.WithTimeout(r.Context(), rt.timeout)
+				defer cancel()
+				r = r.WithContext(ctx)
 			}
-			backend.ServeHTTP(w, r)
+			rt.handler.ServeHTTP(w, r)
 			return
 		}
 	}

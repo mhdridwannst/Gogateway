@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mhdridwannst/Gogateway/internal/config"
 )
@@ -196,5 +197,41 @@ func TestLoadBalancingAndPassiveFailover(t *testing.T) {
 		if gotBackend := resp.Header.Get("X-Gateway-Backend"); gotBackend != b2.URL {
 			t.Errorf("expected traffic routed to %q, got %q", b2.URL, gotBackend)
 		}
+	}
+}
+
+func TestProxyRetryAndTimeout(t *testing.T) {
+	// Test 1: Upstream Timeout triggers 502 Bad Gateway when backend is too slow
+	slowBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slowBackend.Close()
+
+	cfg := &config.Config{
+		Routes: []config.RouteConfig{
+			{
+				Name:       "slow-route",
+				PathPrefix: "/slow",
+				Timeout:    20 * time.Millisecond,
+				Backends:   []string{slowBackend.URL},
+			},
+		},
+	}
+
+	gw, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/slow")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502 Bad Gateway on upstream timeout, got %d", resp.StatusCode)
 	}
 }

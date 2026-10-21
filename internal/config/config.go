@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -18,8 +19,10 @@ const (
 
 // Config represents the root configuration for the gateway.
 type Config struct {
-	Server ServerConfig  `yaml:"server"`
-	Routes []RouteConfig `yaml:"routes"`
+	Server    ServerConfig    `yaml:"server"`
+	IPFilter  IPFilterConfig  `yaml:"ip_filter"`
+	RateLimit RateLimitConfig `yaml:"rate_limit"`
+	Routes    []RouteConfig   `yaml:"routes"`
 }
 
 // ServerConfig holds HTTP server and lifecycle timeouts.
@@ -33,6 +36,29 @@ type ServerConfig struct {
 	MaxHeaderBytes    int           `yaml:"max_header_bytes"`
 }
 
+// IPFilterConfig defines global IP allow and deny lists (supports single IPs or CIDR blocks).
+type IPFilterConfig struct {
+	AllowList []string `yaml:"allow_list"`
+	DenyList  []string `yaml:"deny_list"`
+}
+
+// RateLimitConfig defines per-client-IP token bucket rate limiting parameters.
+type RateLimitConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	RequestsPerSec  float64       `yaml:"requests_per_sec"`
+	Burst           int           `yaml:"burst"`
+	CleanupInterval time.Duration `yaml:"cleanup_interval"`
+	ClientTTL       time.Duration `yaml:"client_ttl"`
+}
+
+// CircuitBreakerConfig defines per-route circuit breaker thresholds.
+type CircuitBreakerConfig struct {
+	Enabled          bool          `yaml:"enabled"`
+	FailureThreshold int           `yaml:"failure_threshold"`
+	ResetTimeout     time.Duration `yaml:"reset_timeout"`
+	HalfOpenMaxReqs  int           `yaml:"half_open_max_requests"`
+}
+
 // HealthCheckConfig defines active and passive health check parameters for a route.
 type HealthCheckConfig struct {
 	Path               string        `yaml:"path"`
@@ -44,13 +70,17 @@ type HealthCheckConfig struct {
 
 // RouteConfig defines how an incoming request path maps to a pool of upstream backends.
 type RouteConfig struct {
-	Name        string            `yaml:"name"`
-	PathPrefix  string            `yaml:"path_prefix"`
-	TargetURL   string            `yaml:"target_url"` // Legacy single-target shorthand
-	Backends    []string          `yaml:"backends"`   // Multi-backend pool URLs
-	Strategy    string            `yaml:"strategy"`   // "round_robin" (default) or "least_conn"
-	StripPrefix bool              `yaml:"strip_prefix"`
-	HealthCheck HealthCheckConfig `yaml:"health_check"`
+	Name           string               `yaml:"name"`
+	PathPrefix     string               `yaml:"path_prefix"`
+	TargetURL      string               `yaml:"target_url"`
+	Backends       []string             `yaml:"backends"`
+	Strategy       string               `yaml:"strategy"`
+	StripPrefix    bool                 `yaml:"strip_prefix"`
+	Timeout        time.Duration        `yaml:"timeout"`
+	Retries        int                  `yaml:"retries"`
+	RetryBackoff   time.Duration        `yaml:"retry_backoff"`
+	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
+	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
 }
 
 // Load reads a YAML configuration file from the given path, applies defaults, and validates it.
@@ -99,14 +129,34 @@ func (c *Config) applyDefaults() {
 		c.Server.MaxHeaderBytes = 1 << 20 // 1 MB
 	}
 
+	if c.RateLimit.Enabled {
+		if c.RateLimit.RequestsPerSec == 0 {
+			c.RateLimit.RequestsPerSec = 20
+		}
+		if c.RateLimit.Burst == 0 {
+			c.RateLimit.Burst = 40
+		}
+		if c.RateLimit.CleanupInterval == 0 {
+			c.RateLimit.CleanupInterval = 1 * time.Minute
+		}
+		if c.RateLimit.ClientTTL == 0 {
+			c.RateLimit.ClientTTL = 3 * time.Minute
+		}
+	}
+
 	for i := range c.Routes {
 		r := &c.Routes[i]
-		// Backward compatibility: promote single target_url into Backends slice.
 		if len(r.Backends) == 0 && r.TargetURL != "" {
 			r.Backends = []string{r.TargetURL}
 		}
 		if r.Strategy == "" {
 			r.Strategy = StrategyRoundRobin
+		}
+		if r.Timeout == 0 {
+			r.Timeout = 5 * time.Second
+		}
+		if r.RetryBackoff == 0 {
+			r.RetryBackoff = 50 * time.Millisecond
 		}
 		if r.HealthCheck.Interval == 0 {
 			r.HealthCheck.Interval = 10 * time.Second
@@ -120,6 +170,17 @@ func (c *Config) applyDefaults() {
 		if r.HealthCheck.HealthyThreshold == 0 {
 			r.HealthCheck.HealthyThreshold = 2
 		}
+		if r.CircuitBreaker.Enabled {
+			if r.CircuitBreaker.FailureThreshold == 0 {
+				r.CircuitBreaker.FailureThreshold = 5
+			}
+			if r.CircuitBreaker.ResetTimeout == 0 {
+				r.CircuitBreaker.ResetTimeout = 10 * time.Second
+			}
+			if r.CircuitBreaker.HalfOpenMaxReqs == 0 {
+				r.CircuitBreaker.HalfOpenMaxReqs = 2
+			}
+		}
 	}
 }
 
@@ -128,6 +189,26 @@ func (c *Config) Validate() error {
 	if c.Server.ReadTimeout < 0 || c.Server.WriteTimeout < 0 || c.Server.IdleTimeout < 0 ||
 		c.Server.ReadHeaderTimeout < 0 || c.Server.ShutdownTimeout < 0 {
 		return errors.New("server timeouts must not be negative")
+	}
+
+	for _, entry := range c.IPFilter.AllowList {
+		if err := validateIPOrCIDR(entry); err != nil {
+			return fmt.Errorf("ip_filter.allow_list: %w", err)
+		}
+	}
+	for _, entry := range c.IPFilter.DenyList {
+		if err := validateIPOrCIDR(entry); err != nil {
+			return fmt.Errorf("ip_filter.deny_list: %w", err)
+		}
+	}
+
+	if c.RateLimit.Enabled {
+		if c.RateLimit.RequestsPerSec <= 0 {
+			return errors.New("rate_limit.requests_per_sec must be > 0 when enabled")
+		}
+		if c.RateLimit.Burst < 1 {
+			return errors.New("rate_limit.burst must be >= 1 when enabled")
+		}
 	}
 
 	if len(c.Routes) == 0 {
@@ -169,6 +250,10 @@ func (c *Config) Validate() error {
 			}
 		}
 
+		if r.Timeout < 0 || r.Retries < 0 || r.RetryBackoff < 0 {
+			return fmt.Errorf("route %q: timeout, retries, and retry_backoff must not be negative", r.Name)
+		}
+
 		if r.HealthCheck.Path != "" && !strings.HasPrefix(r.HealthCheck.Path, "/") {
 			return fmt.Errorf("route %q: health_check.path must start with '/'", r.Name)
 		}
@@ -177,5 +262,18 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+func validateIPOrCIDR(raw string) error {
+	if strings.Contains(raw, "/") {
+		if _, err := netip.ParsePrefix(raw); err != nil {
+			return fmt.Errorf("invalid CIDR %q: %w", raw, err)
+		}
+		return nil
+	}
+	if _, err := netip.ParseAddr(raw); err != nil {
+		return fmt.Errorf("invalid IP address %q: %w", raw, err)
+	}
 	return nil
 }
