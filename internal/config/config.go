@@ -20,6 +20,8 @@ const (
 // Config represents the root configuration for the gateway.
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
+	Admin     AdminConfig     `yaml:"admin"`
+	Logging   LogConfig       `yaml:"logging"`
 	IPFilter  IPFilterConfig  `yaml:"ip_filter"`
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
 	Routes    []RouteConfig   `yaml:"routes"`
@@ -34,6 +36,18 @@ type ServerConfig struct {
 	IdleTimeout       time.Duration `yaml:"idle_timeout"`
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
 	MaxHeaderBytes    int           `yaml:"max_header_bytes"`
+}
+
+// AdminConfig holds configuration for the internal observability/admin HTTP server.
+type AdminConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenAddr string `yaml:"listen_addr"`
+}
+
+// LogConfig defines structured logging settings.
+type LogConfig struct {
+	Level  string `yaml:"level"`  // "debug", "info", "warn", "error"
+	Format string `yaml:"format"` // "json" or "text"
 }
 
 // IPFilterConfig defines global IP allow and deny lists (supports single IPs or CIDR blocks).
@@ -129,6 +143,17 @@ func (c *Config) applyDefaults() {
 		c.Server.MaxHeaderBytes = 1 << 20 // 1 MB
 	}
 
+	if c.Admin.ListenAddr == "" {
+		c.Admin.ListenAddr = ":9091"
+	}
+
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
+	}
+	if c.Logging.Format == "" {
+		c.Logging.Format = "json"
+	}
+
 	if c.RateLimit.Enabled {
 		if c.RateLimit.RequestsPerSec == 0 {
 			c.RateLimit.RequestsPerSec = 20
@@ -189,6 +214,12 @@ func (c *Config) Validate() error {
 	if c.Server.ReadTimeout < 0 || c.Server.WriteTimeout < 0 || c.Server.IdleTimeout < 0 ||
 		c.Server.ReadHeaderTimeout < 0 || c.Server.ShutdownTimeout < 0 {
 		return errors.New("server timeouts must not be negative")
+	}
+
+	switch strings.ToLower(c.Logging.Format) {
+	case "json", "text":
+	default:
+		return fmt.Errorf("logging.format must be 'json' or 'text', got %q", c.Logging.Format)
 	}
 
 	for _, entry := range c.IPFilter.AllowList {

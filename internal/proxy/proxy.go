@@ -231,3 +231,39 @@ func singleJoiningSlash(a, b string) string {
 	}
 	return a + b
 }
+
+// BackendStatus represents a read-only snapshot of a single backend's state for the admin API.
+type BackendStatus struct {
+	URL               string `json:"url"`
+	Alive             bool   `json:"alive"`
+	ActiveConnections int64  `json:"active_connections"`
+}
+
+// RouteStatus represents a read-only snapshot of a route and its backend pool.
+type RouteStatus struct {
+	Name       string          `json:"name"`
+	PathPrefix string          `json:"path_prefix"`
+	Backends   []BackendStatus `json:"backends"`
+}
+
+// RouteSnapshots returns the current health and connection status of all configured routes.
+func (g *Gateway) RouteSnapshots() []RouteStatus {
+	snapshots := make([]RouteStatus, 0, len(g.routes))
+	for _, rt := range g.routes {
+		rawBackends := rt.lb.Backends()
+		bStatuses := make([]BackendStatus, 0, len(rawBackends))
+		for _, b := range rawBackends {
+			bStatuses = append(bStatuses, BackendStatus{
+				URL:               b.URL().String(),
+				Alive:             b.IsAlive(),
+				ActiveConnections: b.ActiveConnections(),
+			})
+		}
+		snapshots = append(snapshots, RouteStatus{
+			Name:       rt.name,
+			PathPrefix: rt.pathPrefix,
+			Backends:   bStatuses,
+		})
+	}
+	return snapshots
+}

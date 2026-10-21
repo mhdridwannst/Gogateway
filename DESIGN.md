@@ -46,3 +46,20 @@
 
 - **Decision**: Wrap each route handler with a state machine (`Closed` $\rightarrow$ `Open` $\rightarrow$ `Half-Open` $\rightarrow$ `Closed`) that trips when consecutive `5xx` responses reach `failure_threshold`.
 - **Rationale**: While passive health checks isolate individual bad nodes in a pool, a route-level circuit breaker protects the entire upstream service (e.g., when a shared database goes down across all nodes) by failing fast with `503 Service Unavailable` and bounding concurrent probe traffic during recovery (`half_open_max_requests`).
+
+## Phase 4: Observability (Prometheus, Structured Logging, Request ID, Admin Server)
+
+### 9. Isolated Prometheus Registry (`prometheus.NewRegistry()`)
+
+- **Decision**: Instantiate a custom `*prometheus.Registry` in `internal/telemetry` instead of registering collectors on `prometheus.DefaultRegisterer`.
+- **Rationale**: Using global mutable state causes panics (`duplicate metrics collector registration`) when multiple gateway instances are initialized across unit tests. A dedicated registry enforces clean dependency injection.
+
+### 10. Dedicated Admin Listener (`:9091`)
+
+- **Decision**: Serve `/healthz`, `/backends`, and `/metrics` on a separate `http.Server` (`admin.listen_addr`) rather than mounting them on the public proxy router (`:8080`).
+- **Rationale**: Exposing internal backend topology (`/backends`) and Prometheus metrics (`/metrics`) on the public ingress port is an information-disclosure risk. Separating the port allows operators to restrict access via VPC security groups or Kubernetes NetworkPolicies.
+
+### 11. Standard Library `log/slog` with Context-Propagated Request IDs
+
+- **Decision**: Use Go's built-in `log/slog` package paired with a 16-byte `crypto/rand` hex `X-Request-ID` stored in `context.Context` via an unexported struct key (`ctxKeyRequestID{}`).
+- **Rationale**: Provides structured JSON logs and correlation IDs out of the box with zero third-party logging or UUID dependencies.

@@ -1,11 +1,15 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/mhdridwannst/Gogateway/internal/telemetry"
 )
 
 func TestIPFilterMiddleware(t *testing.T) {
@@ -66,13 +70,11 @@ func TestRateLimiterMiddleware(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 10 tokens/sec, burst of 2
 	rl := NewRateLimiter(ctx, 10, 2, time.Minute, time.Minute)
 	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// First 2 requests from 10.1.1.1 should succeed (burst = 2)
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.RemoteAddr = "10.1.1.1:1000"
@@ -83,7 +85,6 @@ func TestRateLimiterMiddleware(t *testing.T) {
 		}
 	}
 
-	// 3rd immediate request from 10.1.1.1 should be rate-limited (429)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "10.1.1.1:1000"
 	rec := httptest.NewRecorder()
@@ -95,7 +96,6 @@ func TestRateLimiterMiddleware(t *testing.T) {
 		t.Errorf("expected Retry-After header '1', got %q", got)
 	}
 
-	// Request from a DIFFERENT IP (10.1.1.2) should still succeed
 	reqOther := httptest.NewRequest(http.MethodGet, "/", nil)
 	reqOther.RemoteAddr = "10.1.1.2:1000"
 	recOther := httptest.NewRecorder()
@@ -106,7 +106,6 @@ func TestRateLimiterMiddleware(t *testing.T) {
 }
 
 func TestCircuitBreakerStateTransitions(t *testing.T) {
-	// Trip after 2 failures, reset after 40ms, require 1 success in half-open
 	cb := NewCircuitBreaker(2, 40*time.Millisecond, 1)
 
 	shouldFail := true
@@ -118,7 +117,6 @@ func TestCircuitBreakerStateTransitions(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// 1. Trigger 2 failures -> state transitions from Closed to Open
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
 		upstream.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -131,14 +129,12 @@ func TestCircuitBreakerStateTransitions(t *testing.T) {
 		t.Fatalf("expected circuit state Open, got %s", cb.State())
 	}
 
-	// 2. While Open, requests fast-fail with 503 Service Unavailable
 	rec := httptest.NewRecorder()
 	upstream.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 fast-fail while circuit is Open, got %d", rec.Code)
 	}
 
-	// 3. Wait for resetTimeout (40ms) -> transitions to Half-Open, then heals on 200 OK
 	time.Sleep(50 * time.Millisecond)
 	shouldFail = false
 
@@ -150,6 +146,44 @@ func TestCircuitBreakerStateTransitions(t *testing.T) {
 
 	if cb.State() != StateClosed {
 		t.Fatalf("expected circuit state to return to Closed, got %s", cb.State())
+	}
+}
+
+func TestRequestIDAndObserveMiddleware(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := telemetry.NewLogger(&logBuf, "info", "json")
+	metrics := telemetry.NewMetrics()
+
+	var capturedCtxReqID string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedCtxReqID = RequestIDFromContext(r.Context())
+		w.Header().Set("X-Gateway-Route", "payments")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("created"))
+	})
+
+	chain := RequestID(Observe(logger, metrics, inner))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/payments", nil)
+	rec := httptest.NewRecorder()
+
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", rec.Code)
+	}
+
+	respReqID := rec.Header().Get(RequestIDHeader)
+	if len(respReqID) != 32 {
+		t.Fatalf("expected 32-char hex X-Request-ID header on response, got %q", respReqID)
+	}
+	if capturedCtxReqID != respReqID {
+		t.Errorf("expected context request ID %q to match response header %q", capturedCtxReqID, respReqID)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, `"route":"payments"`) || !strings.Contains(logOutput, respReqID) {
+		t.Errorf("expected JSON log to contain route and request_id, got: %s", logOutput)
 	}
 }
 
