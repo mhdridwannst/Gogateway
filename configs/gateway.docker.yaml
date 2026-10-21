@@ -1,0 +1,67 @@
+server:
+  listen_addr: ":8080"
+  read_timeout: 5s
+  read_header_timeout: 2s
+  write_timeout: 10s
+  idle_timeout: 60s
+  shutdown_timeout: 10s
+  max_header_bytes: 1048576
+
+admin:
+  enabled: true
+  listen_addr: ":9091"
+
+logging:
+  level: "info"
+  format: "json"
+
+rate_limit:
+  enabled: true
+  requests_per_sec: 50
+  burst: 100
+  cleanup_interval: 1m
+  client_ttl: 3m
+
+routes:
+  - name: "users-service"
+    path_prefix: "/api/v1/users"
+    strategy: "round_robin"
+    strip_prefix: true
+    timeout: 3s
+    retries: 2
+    retry_backoff: 50ms
+    backends:
+      - "http://users-1:9001"
+      - "http://users-2:9002"
+    health_check:
+      path: "/"
+      interval: 5s
+      timeout: 2s
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 5
+      reset_timeout: 10s
+      half_open_max_requests: 2
+
+  - name: "orders-service"
+    path_prefix: "/api/v1/orders"
+    strategy: "least_conn"
+    strip_prefix: false
+    timeout: 5s
+    retries: 1
+    retry_backoff: 100ms
+    backends:
+      - "http://orders-1:9003"
+    health_check:
+      path: "/"
+      interval: 5s
+      timeout: 2s
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 5
+      reset_timeout: 10s
+      half_open_max_requests: 2

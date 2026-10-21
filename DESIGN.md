@@ -63,3 +63,10 @@
 
 - **Decision**: Use Go's built-in `log/slog` package paired with a 16-byte `crypto/rand` hex `X-Request-ID` stored in `context.Context` via an unexported struct key (`ctxKeyRequestID{}`).
 - **Rationale**: Provides structured JSON logs and correlation IDs out of the box with zero third-party logging or UUID dependencies.
+
+## Phase 5: Delivery, Containerization, and Kubernetes Readiness
+
+### 12. Static Binary Multi-Stage Build with Non-Root Execution
+
+- **Decision**: Compile with `CGO_ENABLED=0` and `-ldflags="-s -w"` in a `golang:1.23-alpine` builder stage, copying only the binary into a minimal `alpine:3.20` runtime running as UID/GID `10001:10001`.
+- **Rationale**: Eliminates compiler toolchains from the production image (reducing attack surface and image size to ~20 MB) and prevents container breakout privilege escalation by enforcing `runAsNonRoot` and `readOnlyRootFilesystem` in Kubernetes.

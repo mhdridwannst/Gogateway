@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gogateway-config
+  labels:
+    app: gogateway
+data:
+  gateway.yaml: |
+    server:
+      listen_addr: ":8080"
+      read_timeout: 5s
+      read_header_timeout: 2s
+      write_timeout: 10s
+      idle_timeout: 60s
+      shutdown_timeout: 10s
+    admin:
+      enabled: true
+      listen_addr: ":9091"
+    logging:
+      level: "info"
+      format: "json"
+    rate_limit:
+      enabled: true
+      requests_per_sec: 100
+      burst: 200
+    routes:
+      - name: "users-service"
+        path_prefix: "/api/v1/users"
+        strategy: "round_robin"
+        strip_prefix: true
+        timeout: 3s
+        retries: 2
+        backends:
+          - "http://users-service.default.svc.cluster.local:9001"
+        health_check:
+          path: "/healthz"
+          interval: 5s
+          timeout: 2s
+          unhealthy_threshold: 3
+          healthy_threshold: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gogateway
+  labels:
+    app: gogateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gogateway
+  template:
+    metadata:
+      labels:
+        app: gogateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: gateway
+          image: ghcr.io/mhdridwannst/gogateway:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/app/configs/gateway.yaml"]
+          ports:
+            - name: http-proxy
+              containerPort: 8080
+            - name: http-admin
+              containerPort: 9091
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http-admin
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/configs
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: gogateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gogateway
+  labels:
+    app: gogateway
+spec:
+  type: ClusterIP
+  selector:
+    app: gogateway
+  ports:
+    - name: http-proxy
+      port: 80
+      targetPort: http-proxy
+    - name: http-admin
+      port: 9091
+      targetPort: http-admin

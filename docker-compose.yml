@@ -1,0 +1,46 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: gogateway
+    command: ["-config", "/app/configs/gateway.docker.yaml"]
+    volumes:
+      - ./configs/gateway.docker.yaml:/app/configs/gateway.docker.yaml:ro
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    depends_on:
+      - users-1
+      - users-2
+      - orders-1
+    restart: unless-stopped
+
+  users-1:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:9001", '-text={"service":"users","instance":"users-1"}']
+    expose:
+      - "9001"
+
+  users-2:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:9002", '-text={"service":"users","instance":"users-2"}']
+    expose:
+      - "9002"
+
+  orders-1:
+    image: hashicorp/http-echo:1.0
+    command:
+      ["-listen=:9003", '-text={"service":"orders","instance":"orders-1"}']
+    expose:
+      - "9003"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: gogateway-prometheus
+    volumes:
+      - ./deploy/docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - gateway

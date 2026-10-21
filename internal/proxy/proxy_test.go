@@ -235,3 +235,40 @@ func TestProxyRetryAndTimeout(t *testing.T) {
 		t.Errorf("expected 502 Bad Gateway on upstream timeout, got %d", resp.StatusCode)
 	}
 }
+
+func BenchmarkGatewayProxyEndToEnd(b *testing.B) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Routes: []config.RouteConfig{
+			{
+				Name:       "bench-route",
+				PathPrefix: "/bench",
+				Strategy:   config.StrategyRoundRobin,
+				Backends:   []string{backend.URL},
+			},
+		},
+	}
+
+	gw, err := New(cfg)
+	if err != nil {
+		b.Fatalf("failed to create gateway: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/bench/test", nil)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			rec := httptest.NewRecorder()
+			gw.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				b.Fatalf("unexpected status code: %d", rec.Code)
+			}
+		}
+	})
+}
