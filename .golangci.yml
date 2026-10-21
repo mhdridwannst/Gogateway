@@ -12,3 +12,8 @@ linters:
     - staticcheck
     - unused
     - misspell
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
